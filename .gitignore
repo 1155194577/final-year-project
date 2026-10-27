@@ -1,0 +1,7 @@
+data/
+.venv/
+.ssh/
+logs/
+__pycache__/
+*.pyc
+slurm-*.out
