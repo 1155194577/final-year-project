@@ -12,6 +12,7 @@ class TrainConfig:
     epochs = 10
     batch_size = 32
     val_fraction = 0.2
+    split = "utterance"  # "speaker" holds out whole speakers
     seed = 42
     data_dir = "data/libritts_preprocessed/dev.clean_36speakers_20utts"
     model_dir = None   # SpeechTokenizer snapshot root; downloads if None

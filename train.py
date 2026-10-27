@@ -56,15 +56,25 @@ def get_data(config, bundle, layer):
         dtype=torch.long,
     )
 
-    # Split each speaker's utterances the same way: some for training, some held out.
     rng = random.Random(config.seed)
     train_idx, val_idx = [], []
-    for spk in range(len(speakers)):
-        idx = torch.nonzero(labels == spk).flatten().tolist()
-        rng.shuffle(idx)
-        cut = int(len(idx) * (1 - config.val_fraction))
-        train_idx += idx[:cut]
-        val_idx += idx[cut:]
+    if config.split == "speaker":
+        # Hold out whole speakers: the probe never sees the val voices, so the
+        # accuracy measures generalisation rather than speaker memorisation.
+        order = list(range(len(speakers)))
+        rng.shuffle(order)
+        cut = int(len(order) * (1 - config.val_fraction))
+        held_out = set(order[cut:])
+        for i, label in enumerate(labels.tolist()):
+            (val_idx if label in held_out else train_idx).append(i)
+    else:
+        # Split each speaker's utterances: every speaker appears in both sets.
+        for spk in range(len(speakers)):
+            idx = torch.nonzero(labels == spk).flatten().tolist()
+            rng.shuffle(idx)
+            cut = int(len(idx) * (1 - config.val_fraction))
+            train_idx += idx[:cut]
+            val_idx += idx[cut:]
 
     # Standardize on training statistics.
     mean, std = features[train_idx].mean(dim=0), features[train_idx].std(dim=0) + 1e-6
@@ -170,6 +180,8 @@ def parse_args(argv=None):
     parser.add_argument("--reg-weight", type=float, default=TrainConfig.reg_weight)
     parser.add_argument("--n-q", type=int, default=TrainConfig.n_q)
     parser.add_argument("--val-fraction", type=float, default=TrainConfig.val_fraction)
+    parser.add_argument("--split", choices=("utterance", "speaker"),
+                        default=TrainConfig.split)
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
 
     config = TrainConfig()
