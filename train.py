@@ -191,6 +191,7 @@ def parse_args(argv=None):
 
 
 def main(config):
+    torch.manual_seed(config.seed)  # reproducible probe init (nn.Linear is not seeded by default)
     device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"device: {device}")
     print(f"regularizer: {config.regularizer} (weight {config.reg_weight})")

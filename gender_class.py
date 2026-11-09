@@ -165,7 +165,8 @@ def plot_tsne(features, prediction, ground_truth, held_out, title, out_path):
         max_iter=1000,
     ).fit_transform(features.numpy())
 
-    fig, ax = plt.subplots(figsize=(8, 6.5))
+    plt.rcParams.update({"font.size": 13})
+    fig, ax = plt.subplots(figsize=(7.5, 6.3))
     colors = ("#d1495b", "#2e86ab")  # female, male
     for label, gender in enumerate(GENDERS):
         mask = (ground_truth == label).numpy()
@@ -182,13 +183,13 @@ def plot_tsne(features, prediction, ground_truth, held_out, title, out_path):
         label=f"misclassified held-out utterance (n={int(wrong.sum())})",
     )
 
-    ax.set_title(title)
+    ax.set_title(title, fontsize=12)
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.legend(loc="best", fontsize=9, frameon=False)
+    ax.legend(loc="best", fontsize=10, frameon=False)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {out_path}")
     return out_path
@@ -196,6 +197,7 @@ def plot_tsne(features, prediction, ground_truth, held_out, title, out_path):
 
 def main():
     config = TrainConfig()
+    torch.manual_seed(config.seed)  # reproducible probe init
     print(f"epochs={config.epochs} batch={config.batch_size} lr={config.lr} "
           f"optimizer={config.optimizer} regularizer={config.regularizer}")
 
@@ -213,8 +215,7 @@ def main():
         held_out[data.val_idx] = True
         plot_tsne(
             data.x, data.predictions, data.y, held_out,
-            title=f"t-SNE of {data.name} embeddings (colour = gender, "
-                  f"held-out speaker acc = {accuracy:.3f})",
+            title=f"t-SNE of {data.name} (held-out speaker acc {accuracy:.3f})",
             out_path=FIGS_DIR / f"tsne_gender_{data.name}.png",
         )
 
