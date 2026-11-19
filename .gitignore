@@ -1,7 +1,17 @@
+# Large local artefacts (audio, checkpoint, feature caches) - never commit
 data/
+aligned/
+mfa_corpus/
+
+# Environments
 .venv/
 .ssh/
+
+# Run output
 logs/
 __pycache__/
 *.pyc
 slurm-*.out
+
+# OS
+.DS_Store

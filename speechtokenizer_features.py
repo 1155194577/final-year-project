@@ -11,8 +11,11 @@ For every utterance and every RVQ layer:
 3. apply the quantizer's output projection;
 4. sum layers 0..k (RVQ layers are residual, so this prefix sum is what the
    decoder actually reconstructs at depth k);
-5. mean-pool over time;
-6. optionally L2-normalize.
+5. mean-pool over time (``pool="time"``), or keep every frame (``pool="none"``,
+   written to ``frames.npz``);
+6. optionally L2-normalize. Pooled mode normalises the clip vector; frame mode
+   normalises each frame independently, so ``frames.mean(-1)`` will not equal
+   the pooled vector.
 
 Example:
     dataset = DataPreprocessor(...).prepare()
@@ -118,11 +121,15 @@ class SpeechTokenizerFeatureExtractor:
         device: str | None = None,
         layers: list[int] | None = None,
         normalize: bool = True,
+        pool: str = "time",
     ) -> None:
         self.model_dir = model_dir
         self.requested_device = device
         self.layers = layers
         self.normalize = normalize
+        if pool not in ("time", "none"):
+            raise ValueError(f"pool must be 'time' or 'none', got {pool!r}")
+        self.pool = pool
         self._model = None
         self._device = None
 
@@ -148,7 +155,7 @@ class SpeechTokenizerFeatureExtractor:
 
     @torch.no_grad()
     def extract_one(self, audio_path: Path) -> tuple[np.ndarray, int]:
-        """Return [num_layers, dimension] and the number of frames."""
+        """Return [num_layers, dimension] (pooled) or [num_layers, dimension, frames]."""
         model = self._ensure_model()
         waveform = load_audio(audio_path, model.sample_rate)
         codes = model.encode(waveform.unsqueeze(0).unsqueeze(0).to(self._device))
@@ -168,11 +175,16 @@ class SpeechTokenizerFeatureExtractor:
             # depth-k representation is the cumulative sum, not layer k alone.
             # With a contiguous layer list starting at 0 this is exactly q_0+..+q_k.
             total = frame_vectors if total is None else total + frame_vectors
-            vectors.append(total.mean(dim=0))
+            # "time"  -> [layers, dim]          one vector per clip
+            # "none"  -> [layers, dim, frames]  one vector per 40 ms frame
+            vectors.append(total.mean(dim=0) if self.pool == "time" else total.T)
 
         features = torch.stack(vectors).float().cpu().numpy()
         if self.normalize:
-            norms = np.linalg.norm(features, axis=-1, keepdims=True)
+            # Pooled: [layers, dim] -> norm over dim. Framed: [layers, dim,
+            # frames] -> norm over dim per frame (axis=1).
+            axis = -1 if features.ndim == 2 else 1
+            norms = np.linalg.norm(features, axis=axis, keepdims=True)
             if np.any(norms < 1e-8):
                 raise RuntimeError(f"Zero-length embedding for {audio_path}")
             features = features / norms
@@ -185,7 +197,7 @@ class SpeechTokenizerFeatureExtractor:
         overwrite: bool = False,
     ) -> FeatureBundle:
         output_dir = output_dir or (dataset.root / "features")
-        feature_path = output_dir / "features.npz"
+        feature_path = output_dir / ("frames.npz" if self.pool == "none" else "features.npz")
         if feature_path.exists() and not overwrite:
             print(f"Loading cached features from {feature_path}")
             return FeatureBundle.load(feature_path, output_dir)
@@ -206,8 +218,39 @@ class SpeechTokenizerFeatureExtractor:
             print(
                 f"[{index:03d}/{dataset.num_utterances:03d}] "
                 f"{audio_path.name}: {frames} frames, "
-                f"{layer_features.shape[0]} layers"
+                f"{layer_features.shape[0]} layers, "
+                f"{'pooled' if self.pool == 'time' else 'kept per frame'}"
             )
+
+        if self.pool == "none":
+            # Clips have different lengths, so pad to the longest and store the
+            # true length of every clip alongside the frames.
+            lengths = np.asarray([f.shape[-1] for f in features], dtype=np.int32)
+            width = int(lengths.max())
+            tensor = np.zeros((len(features), features[0].shape[0], features[0].shape[1], width),
+                              dtype=np.float16)
+            for i, f in enumerate(features):
+                tensor[i, :, :, : f.shape[-1]] = f
+            np.savez_compressed(
+                feature_path,
+                frames=tensor,
+                lengths=lengths,
+                speaker_ids=dataset.speaker_ids,
+                genders=dataset.genders,
+                utterance_ids=np.asarray(dataset.utterance_ids),
+                slots=dataset.slots,
+                layer_indices=layer_indices,
+                split=np.asarray(dataset.split),
+            )
+            print(f"Wrote {feature_path}  shape {tensor.shape} (float16)")
+            return {
+                "path": str(feature_path),
+                "num_utterances": len(features),
+                "num_layers": int(tensor.shape[1]),
+                "dimension": int(tensor.shape[2]),
+                "max_frames": int(width),
+                "dtype": "float16",
+            }
 
         feature_tensor = np.stack(features)
         bundle = FeatureBundle(
@@ -257,6 +300,16 @@ def main() -> None:
         action="store_true",
         help="Keep raw mean-pooled vectors.",
     )
+    parser.add_argument(
+        "--frames",
+        action="store_true",
+        help="Keep one vector per frame (writes frames.npz) instead of mean-pooling.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Where to write the cache (default: <dataset-dir>/features).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -266,8 +319,11 @@ def main() -> None:
         device=args.device,
         layers=args.layers,
         normalize=not args.no_normalize,
+        pool="none" if args.frames else "time",
     )
-    bundle = extractor.extract(dataset, overwrite=args.overwrite)
+    bundle = extractor.extract(
+        dataset, output_dir=args.output_dir, overwrite=args.overwrite
+    )
     print(bundle.summary())
 
 
