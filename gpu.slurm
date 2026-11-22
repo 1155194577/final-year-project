@@ -72,11 +72,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-singularity exec --nv "$IMAGE" python -m pip install -q --no-cache-dir --target "$DEPS" \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
-    speechtokenizer beartype soundfile pyarrow tensorboard
-
-run() { singularity exec --nv --env PYTHONPATH="$DEPS" "$IMAGE" python -u "$@"; }
+# Compute nodes have NO internet (verified: pypi and huggingface both blocked),
+# so dependencies come from a wheelhouse pushed with push_assets.sh. Falls back
+# to PyPI only if the wheelhouse is absent.
+# Singularity only auto-binds $HOME and /tmp, so /research/d7 must be bound
+# explicitly or every path under WORKDIR looks missing inside the container.
+BIND="--bind $WORKDIR:$WORKDIR"
+WHEELS=${WHEELS:-$WORKDIR/assets/wheelhouse}
+if [[ -d "$WHEELS" ]]; then
+    echo "installing deps offline from $WHEELS"
+    # --no-deps + explicit list: with --target pip resolves against the target
+    # dir, not the image, so it would otherwise demand numpy/torch wheels that
+    # the image already provides. Everything else comes from the wheelhouse.
+    DEP_PKGS="speechtokenizer beartype einops huggingface_hub lion_pytorch accelerate \
+matplotlib scipy soundfile pyarrow tensorboard contourpy cycler fonttools kiwisolver \
+pillow pyparsing python-dateutil six certifi charset-normalizer idna urllib3 filelock \
+fsspec packaging pyyaml requests tqdm typing-extensions psutil safetensors absl-py \
+grpcio markdown protobuf tensorboard-data-server werkzeug cffi pycparser"
+    singularity exec --nv $BIND "$IMAGE" python -m pip install -q --no-index --no-deps \
+        --find-links "$WHEELS" --target "$DEPS" $DEP_PKGS
+else
+    echo "no wheelhouse at $WHEELS - trying PyPI (will fail without egress)"
+    singularity exec --nv "$IMAGE" python -m pip install -q --no-cache-dir --target "$DEPS" \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        speechtokenizer beartype soundfile pyarrow tensorboard
+fi
+run() { singularity exec --nv $BIND --env PYTHONPATH="$DEPS" --env DATA="$DATA" \
+        --env MODEL_DIR="$MODEL_DIR" "$IMAGE" python -u "$@"; }
 
 extract_frames() {
     if [[ -f "$FEATURES_DIR/frames.npz" ]]; then
@@ -93,6 +115,26 @@ extract_frames() {
 }
 
 case "$MODE" in
+    check)
+        echo "== environment check =="
+        run -c "
+import sys, os, json
+from pathlib import Path
+print('python', sys.version.split()[0])
+import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(),
+                   torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')
+for m in ('speechtokenizer','soundfile','pyarrow','einops','scipy','huggingface_hub','tensorboard','beartype'):
+    try:
+        mod = __import__(m); print('OK  ', m, getattr(mod,'__version__','?'))
+    except Exception as e:
+        print('MISS', m, type(e).__name__)
+from backbone import load_model
+d = Path(os.environ['DATA'])
+print('dataset clips', len(list((d/'audio').glob('*.wav'))))
+m = load_model(os.environ.get('MODEL_DIR'), 'cpu')
+print('model ok: n_q', m.n_q, 'sr', m.sample_rate)
+"
+        ;;
     frames) extract_frames ;;
     probe)
         extract_frames

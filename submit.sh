@@ -73,21 +73,50 @@ SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes)
 
 ssh_do() { ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"; }
 
-# Resume-capable rsync. The VPN drops mid-transfer (observed: broken pipe after
-# 47 min, mid-checkpoint), so retry and continue from the partial file rather
-# than restarting a 465 MB upload from zero.
+# Two transfer paths, because macOS ships openrsync (protocol 29), which does
+# NOT support --inplace/--append-verify: it fails with a usage dump. So use
+# plain -az (portable) with retries, and for big single files resume at chunk
+# granularity with dd over ssh instead of relying on rsync's partial support.
 retry_rsync() {
     local src=$1 dst=$2; shift 2
     local attempt
     for attempt in 1 2 3; do
-        if rsync -az --inplace --append-verify --partial --timeout=180 \
-             -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$dst"; then
+        if rsync -az -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$dst"; then
             return 0
         fi
         echo "  rsync attempt $attempt failed, retrying in 10s ..." >&2
         sleep 10
     done
     return 1
+}
+
+# Resume a large file by streaming fixed-size chunks and seeking on the remote
+# side. No extra local disk, and a dropped connection only costs one chunk.
+upload_resumable() {
+    local src=$1 dst=$2 chunk_mb=${3:-32}
+    local size total_chunks i start skip
+    size=$(stat -f%z "$src")
+    total_chunks=$(( (size + chunk_mb*1024*1024 - 1) / (chunk_mb*1024*1024) ))
+    ssh_do "mkdir -p '$(dirname "$dst")'"
+    echo "  uploading $(basename "$src") in $total_chunks x ${chunk_mb}MB chunks"
+    for ((i=0; i<total_chunks; i++)); do
+        start=$((i*chunk_mb*1024*1024))
+        for attempt in 1 2 3 4 5; do
+            if dd if="$src" bs=1m skip=$((start/1048576)) count=$chunk_mb 2>/dev/null \
+                 | ssh_do "dd of='$dst' bs=1m seek=$((start/1048576)) conv=notrunc 2>/dev/null"; then
+                break
+            fi
+            echo "  chunk $((i+1))/$total_chunks failed (attempt $attempt), retrying ..." >&2
+            sleep 5
+        done
+    done
+    local remote_size
+    remote_size=$(ssh_do "stat -c%s '$dst' 2>/dev/null || echo 0" | tr -d ' ')
+    if [[ "$remote_size" != "$size" ]]; then
+        echo "  size mismatch: local $size vs remote $remote_size" >&2
+        return 1
+    fi
+    return 0
 }
 # every slurm call needs the conf exported on the remote side
 ssh_slurm() { ssh_do "export SLURM_CONF='$SLURM_CONF'; $1"; }
@@ -131,13 +160,13 @@ if [[ "$SYNC" -eq 1 ]]; then
             --exclude 'frames.npz'
     fi
     if [[ "$MODEL" -eq 1 && -d "$HERE/data/SpeechTokenizer" ]]; then
-        echo "== model -> $REMOTE:$WORKDIR/datasets/SpeechTokenizer/  (465 MB, resumable)"
-        if ! retry_rsync "$HERE/data/SpeechTokenizer/" \
-                "$REMOTE:$WORKDIR/datasets/SpeechTokenizer/"; then
-            echo "warning: checkpoint upload incomplete; the job will fail until it" >&2
-            echo "         finishes. Rerun ./submit.sh to resume, or pass --no-model" >&2
-            echo "         if the compute node can download the checkpoint itself." >&2
+        echo "== model -> $REMOTE:$WORKDIR/datasets/SpeechTokenizer/  (465 MB, chunked)"
+        if ! upload_resumable "$HERE/data/SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt" \
+                "$WORKDIR/datasets/SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt" 32; then
+            echo "warning: checkpoint upload incomplete; jobs will fail until it finishes." >&2
         fi
+        retry_rsync "$HERE/data/SpeechTokenizer/speechtokenizer_hubert_avg/config.json" \
+            "$REMOTE:$WORKDIR/datasets/SpeechTokenizer/speechtokenizer_hubert_avg/" || true
     fi
 else
     echo "== skipping sync (--no-sync)"
