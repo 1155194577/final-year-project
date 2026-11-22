@@ -61,7 +61,10 @@ def main():
     ap.add_argument("--male", default="174")
     ap.add_argument("--female", default="84")
     ap.add_argument("--layer", type=int, default=7, help="RVQ depth to edit (1-based), default 8")
-    ap.add_argument("--mode", choices=("scalar", "diag"), default="scalar")
+    ap.add_argument("--mode", choices=("scalar", "diag", "perphone"), default="scalar",
+                    help="perphone: one bias b_p per phone class, x' = x + gain*b_p")
+    ap.add_argument("--gain", type=float, default=1.0,
+                    help="multiplier on the per-phone bias (perphone mode only)")
     ap.add_argument("--clips", type=int, default=20, help="clips per speaker")
     ap.add_argument("--device", default="mps")
     args = ap.parse_args()
@@ -109,7 +112,15 @@ def main():
     pairs_m = [torch.from_numpy(mM[p]) for p in shared]
     pairs_f = [torch.from_numpy(mF[p]) for p in shared]
 
-    if args.mode == "scalar":
+    if args.mode == "perphone":
+        # Closed form for x' = x + b_p: the bias is just the phone-conditional
+        # difference of means, so there is nothing to train.
+        bias = {p: torch.from_numpy(mF[p] - mM[p]) for p in shared}
+        print(f"per-phone bias fitted for {len(bias)} classes | "
+              f"median |b_p| = {torch.stack(list(bias.values())).norm(dim=1).median():.2f} | "
+              f"gain {args.gain}")
+        resid = float("nan")
+    elif args.mode == "scalar":
         a, b, resid = fit_scalar(pairs_m, pairs_f)
         print(f"fitted a = {a:.4f}, |b| = {b.norm():.2f}, relative residual {resid:.1%}")
         transform = lambda x: a * x + b
@@ -119,9 +130,20 @@ def main():
               f"relative residual {resid:.1%}")
         transform = lambda x: a * x + b
 
+    if args.mode == "perphone":
+        def transform(x, labels=None):
+            out = x.clone()
+            if labels is None:
+                return out
+            for p, vec in bias.items():
+                mask = torch.from_numpy(labels == p)
+                if mask.any():
+                    out[mask] = out[mask] + args.gain * vec
+            return out
+
     # How much does the fitted map actually move a frame, relative to its norm?
     Mx_t = torch.from_numpy(Mx)
-    moved = transform(Mx_t) - Mx_t
+    moved = transform(Mx_t, My) - Mx_t
     disp = (moved.norm(dim=1) / Mx_t.norm(dim=1)).median().item()
     # ...and how much of that movement is in the male->female direction?
     fem = phone_means(Fx, Fy, n_phones, layer)
@@ -137,11 +159,13 @@ def main():
     wav = load_audio(DATA / src["file"], SR)
     total, per = code_space_frames(model, wav)
     cum = sum(per[: layer + 1])                                # [T, dim]
+    clip_labels = phones["labels"][label_of[src["id"]]][: len(cum)]
     with torch.no_grad():
-        edited = transform(cum)                                # [T, dim]
+        edited = transform(cum, clip_labels)                 # [T, dim]
         out = model.decoder(edited.T[None])[0, 0].cpu().numpy()   # decoder wants [1, dim, T]
 
-    label = f"a{a:.3f}" if args.mode == "scalar" else "diag"
+    label = (f"a{a:.3f}" if args.mode == "scalar"
+             else ("diag" if args.mode == "diag" else f"perphone_g{args.gain:g}"))
     path = OUT / f"{src['id']}_{args.mode}_{label}.wav"
     sf.write(path, out, SR)
     print(f"wrote {path} ({len(out)/SR:.2f}s)")
