@@ -15,3 +15,6 @@ slurm-*.out
 
 # OS
 .DS_Store
+# kNN-VC baseline: cloned repo + ~1.3 GB checkpoints
+third_party/
+*.pt
