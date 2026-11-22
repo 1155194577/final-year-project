@@ -72,6 +72,23 @@ fi
 SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes)
 
 ssh_do() { ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"; }
+
+# Resume-capable rsync. The VPN drops mid-transfer (observed: broken pipe after
+# 47 min, mid-checkpoint), so retry and continue from the partial file rather
+# than restarting a 465 MB upload from zero.
+retry_rsync() {
+    local src=$1 dst=$2; shift 2
+    local attempt
+    for attempt in 1 2 3; do
+        if rsync -az --inplace --append-verify --partial --timeout=180 \
+             -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$dst"; then
+            return 0
+        fi
+        echo "  rsync attempt $attempt failed, retrying in 10s ..." >&2
+        sleep 10
+    done
+    return 1
+}
 # every slurm call needs the conf exported on the remote side
 ssh_slurm() { ssh_do "export SLURM_CONF='$SLURM_CONF'; $1"; }
 
@@ -105,18 +122,22 @@ if [[ "$SYNC" -eq 1 ]]; then
               --exclude .DS_Store --exclude .venv --exclude logs --exclude 'slurm-*.out'
               --exclude 'data/' --exclude third_party/ --exclude '*.pt')
     ssh_do "mkdir -p '$REMOTE_DIR' '$WORKDIR/datasets' '$WORKDIR/features' '$WORKDIR/checkpoints' '$WORKDIR/logs'"
-    rsync -az -e "ssh ${SSH_OPTS[*]}" "${EXCLUDES[@]}" "$HERE/" "$REMOTE:$REMOTE_DIR/"
+    retry_rsync "$HERE/" "$REMOTE:$REMOTE_DIR/" "${EXCLUDES[@]}"
 
     if [[ "$DATA" -eq 1 ]]; then
         echo "== data -> $REMOTE:$WORKDIR/datasets/$DATASET/"
         # frames.npz is 2.8 GB and regenerated on the compute node; never shipped
-        rsync -az -e "ssh ${SSH_OPTS[*]}" --exclude 'frames.npz' \
-            "$DATA_LOCAL/" "$REMOTE:$WORKDIR/datasets/$DATASET/"
+        retry_rsync "$DATA_LOCAL/" "$REMOTE:$WORKDIR/datasets/$DATASET/" \
+            --exclude 'frames.npz'
     fi
     if [[ "$MODEL" -eq 1 && -d "$HERE/data/SpeechTokenizer" ]]; then
-        echo "== model -> $REMOTE:$WORKDIR/datasets/SpeechTokenizer/"
-        rsync -az -e "ssh ${SSH_OPTS[*]}" \
-            "$HERE/data/SpeechTokenizer/" "$REMOTE:$WORKDIR/datasets/SpeechTokenizer/"
+        echo "== model -> $REMOTE:$WORKDIR/datasets/SpeechTokenizer/  (465 MB, resumable)"
+        if ! retry_rsync "$HERE/data/SpeechTokenizer/" \
+                "$REMOTE:$WORKDIR/datasets/SpeechTokenizer/"; then
+            echo "warning: checkpoint upload incomplete; the job will fail until it" >&2
+            echo "         finishes. Rerun ./submit.sh to resume, or pass --no-model" >&2
+            echo "         if the compute node can download the checkpoint itself." >&2
+        fi
     fi
 else
     echo "== skipping sync (--no-sync)"
